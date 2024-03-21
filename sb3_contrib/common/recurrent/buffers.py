@@ -17,32 +17,33 @@ from sb3_contrib.common.recurrent.type_aliases import (
 def pad(
     seq_start_indices: np.ndarray,
     seq_end_indices: np.ndarray,
+    max_seq_len: int,
     device: th.device,
     tensor: np.ndarray,
-    padding_value: float = 0.0,
 ) -> th.Tensor:
     """
     Chunk sequences and pad them to have constant dimensions.
 
     :param seq_start_indices: Indices of the transitions that start a sequence
-    :param seq_end_indices: Indices of the transitions that end a sequence
+    :param seq_end_indices: Indices (exclusive) of the transitions that end a sequence
+    :param max_seq_len: precomputed max(seq_end_indices - seq_start_indices)
     :param device: PyTorch device
     :param tensor: Tensor of shape (batch_size, *tensor_shape)
-    :param padding_value: Value used to pad sequence to the same length
-        (zero padding by default)
     :return: (n_seq, max_length, *tensor_shape)
     """
     # Create sequences given start and end
-    seq = [th.tensor(tensor[start : end + 1], device=device) for start, end in zip(seq_start_indices, seq_end_indices)]
-    return th.nn.utils.rnn.pad_sequence(seq, batch_first=True, padding_value=padding_value)
+    padded = np.zeros((seq_start_indices.shape[0], max_seq_len, *tensor.shape[1:]), dtype=np.float32)
+    for i, (start, end) in enumerate(zip(seq_start_indices, seq_end_indices)):
+        padded[i, : (end - start)] = tensor[start:end]
+    return th.as_tensor(padded, dtype=th.float32, device=device)
 
 
 def pad_and_flatten(
     seq_start_indices: np.ndarray,
     seq_end_indices: np.ndarray,
+    max_seq_len: int,
     device: th.device,
     tensor: np.ndarray,
-    padding_value: float = 0.0,
 ) -> th.Tensor:
     """
     Pad and flatten the sequences of scalar values,
@@ -50,14 +51,13 @@ def pad_and_flatten(
     From (batch_size, 1) to (n_seq, max_length, 1) -> (n_seq * max_length,)
 
     :param seq_start_indices: Indices of the transitions that start a sequence
-    :param seq_end_indices: Indices of the transitions that end a sequence
+    :param seq_end_indices: Indices (exclusive) of the transitions that end a sequence
+    :param max_seq_len: precomputed max(seq_end_indices - seq_start_indices)
     :param device: PyTorch device (cpu, gpu, ...)
     :param tensor: Tensor of shape (max_length, n_seq, 1)
-    :param padding_value: Value used to pad sequence to the same length
-        (zero padding by default)
     :return: (n_seq * max_length,) aka (padded_batch_size,)
     """
-    return pad(seq_start_indices, seq_end_indices, device, tensor, padding_value).flatten()
+    return pad(seq_start_indices, seq_end_indices, max_seq_len, device, tensor).flatten()
 
 
 def create_sequencers(
@@ -83,14 +83,15 @@ def create_sequencers(
     seq_start[0] = True
     # Retrieve indices of sequence starts
     seq_start_indices = np.where(seq_start == True)[0]  # noqa: E712
-    # End of sequence are just before sequence starts
+    # End of sequence are just before sequence starts, exclusive end index identical to next start
     # Last index is also always end of a sequence
-    seq_end_indices = np.concatenate([(seq_start_indices - 1)[1:], np.array([len(episode_starts)])])
+    seq_end_indices = np.concatenate([seq_start_indices[1:], np.array([len(episode_starts)])])
 
     # Create padding method for this minibatch
-    # to avoid repeating arguments (seq_start_indices, seq_end_indices)
-    local_pad = partial(pad, seq_start_indices, seq_end_indices, device)
-    local_pad_and_flatten = partial(pad_and_flatten, seq_start_indices, seq_end_indices, device)
+    # to avoid repeating arguments (seq_start_indices, seq_end_indices, max_seq_len)
+    max_seq_len = int(np.max(seq_end_indices - seq_start_indices))
+    local_pad = partial(pad, seq_start_indices, seq_end_indices, max_seq_len, device)
+    local_pad_and_flatten = partial(pad_and_flatten, seq_start_indices, seq_end_indices, max_seq_len, device)
     return seq_start_indices, local_pad, local_pad_and_flatten
 
 
