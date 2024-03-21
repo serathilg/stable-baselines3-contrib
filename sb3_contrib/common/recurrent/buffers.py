@@ -185,9 +185,9 @@ class RecurrentRolloutBuffer(RolloutBuffer):
         indices = np.arange(self.buffer_size * self.n_envs)
         indices = np.concatenate((indices[split_index:], indices[:split_index]))
 
-        env_change = np.zeros(self.buffer_size * self.n_envs).reshape(self.buffer_size, self.n_envs)
+        env_change = np.zeros(self.buffer_size * self.n_envs, dtype=bool).reshape(self.buffer_size, self.n_envs)
         # Flag first timestep as change of environment
-        env_change[0, :] = 1.0
+        env_change[0, :] = True
         env_change = self.swap_and_flatten(env_change)
 
         start_idx = 0
@@ -209,27 +209,28 @@ class RecurrentRolloutBuffer(RolloutBuffer):
 
         # Number of sequences
         n_seq = len(self.seq_start_indices)
-        max_length = self.pad(self.actions[batch_inds]).shape[1]
+        padded_actions = self.pad(self.actions[batch_inds])
+        max_length = padded_actions.shape[1]
         padded_batch_size = n_seq * max_length
         # We retrieve the lstm hidden states that will allow
         # to properly initialize the LSTM at the beginning of each sequence
+        buffer_seq_start_indices = batch_inds[self.seq_start_indices]
         lstm_states_pi = (
-            # 1. (n_envs * n_steps, n_layers, dim) -> (batch_size, n_layers, dim)
-            # 2. (batch_size, n_layers, dim)  -> (n_seq, n_layers, dim)
-            # 3. (n_seq, n_layers, dim) -> (n_layers, n_seq, dim)
-            self.hidden_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1).contiguous(),
-            self.cell_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1).contiguous(),
+            # 1. select starts: (n_envs * n_steps, n_layers, dim) -> (n_seq, n_layers, dim)
+            # 2. swapaxes: (n_seq, n_layers, dim) -> (n_layers, n_seq, dim)
+            self.hidden_states_pi[buffer_seq_start_indices].swapaxes(0, 1).contiguous(),
+            self.cell_states_pi[buffer_seq_start_indices].swapaxes(0, 1).contiguous(),
         )
         lstm_states_vf = (
             # (n_envs * n_steps, n_layers, dim) -> (n_layers, n_seq, dim)
-            self.hidden_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1).contiguous(),
-            self.cell_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1).contiguous(),
+            self.hidden_states_vf[buffer_seq_start_indices].swapaxes(0, 1).contiguous(),
+            self.cell_states_vf[buffer_seq_start_indices].swapaxes(0, 1).contiguous(),
         )
 
         return RecurrentRolloutBufferSamples(
             # (batch_size, obs_dim) -> (n_seq, max_length, obs_dim) -> (n_seq * max_length, obs_dim)
             observations=self.pad(self.observations[batch_inds]).reshape((padded_batch_size, *self.obs_shape)),
-            actions=self.pad(self.actions[batch_inds]).reshape((padded_batch_size,) + self.actions.shape[1:]),
+            actions=padded_actions.reshape((padded_batch_size,) + self.actions.shape[1:]),
             old_values=self.pad_and_flatten(self.values[batch_inds]),
             old_log_prob=self.pad_and_flatten(self.log_probs[batch_inds]),
             advantages=self.pad_and_flatten(self.advantages[batch_inds]),
