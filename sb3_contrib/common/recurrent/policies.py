@@ -186,28 +186,66 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
         features_sequence = features.reshape((n_seq, -1, lstm.input_size)).swapaxes(0, 1)
         episode_starts = episode_starts.reshape((n_seq, -1)).swapaxes(0, 1)
 
-        # If we don't have to reset the state in the middle of a sequence
-        # we can avoid the for loop, which speeds up things
-        if th.all(episode_starts == 0.0):
-            lstm_output, lstm_states = lstm(features_sequence, lstm_states)
-            lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
-            return lstm_output, lstm_states
+        seq_length = features_sequence.shape[0]
+        # if max sequence length is one (during data collection), then just simple lstm forward.
+        # otherwise, try to run sequence in chunks between episode_starts
+        if seq_length > 1:
+            lstm_outputs = []
+            # need to stop lstm at break, where there is a episode_start in one of the envs, to reset lstm_state
+            # try to run entire chunks (without start in them) at once (avoid python loop per step)
+            has_start = episode_starts.bool()
+            # in current implementation, every episode start (or env change) is always at the start of the sequence
+            # but allow for multiple episodes to be packed into one sequence (e.g. to balance uneven lengths)
+            if has_start[0].any() and not has_start[1:].any():
+                # faster guard to avoid expensive nonzero() for usual case of just start at first
+                breaks = [0]
+            else:
+                breaks = has_start.any(dim=1).nonzero()[:, 0].tolist()
 
-        lstm_output = []
-        # Iterate over the sequence
-        for features, episode_start in zip_strict(features_sequence, episode_starts):
-            hidden, lstm_states = lstm(
-                features.unsqueeze(dim=0),
+            # convert break indices into chunk start and (exclusive) end indices
+            if len(breaks) > 0 and breaks[0] == 0:
+                # first break is already at 0, common case during training
+                chunk_starts = list(breaks)
+                chunk_ends = [*breaks[1:], seq_length]
+            elif len(breaks) == 0:
+                # everything as one chunk
+                chunk_starts = [0]
+                chunk_ends = [seq_length]
+            else:
+                # first chunk before first break
+                chunk_starts = [0, *breaks]
+                chunk_ends = [breaks[0], *breaks[1:], seq_length]
+
+            for break_idx, next_break_idx in zip_strict(chunk_starts, chunk_ends):
+                # reset lstm_state in envs where necessary and run chunk till break
+                episode_start = episode_starts[break_idx]
+                mask = (1.0 - episode_start).view(1, n_seq, 1)
+                chunk_output, lstm_states = lstm(
+                    features_sequence[break_idx:next_break_idx],
+                    (
+                        # Reset the states at the beginning of a new episode
+                        mask * lstm_states[0],
+                        mask * lstm_states[1],
+                    ),
+                )
+
+                lstm_outputs += [chunk_output]
+
+            # Sequence to batch
+            # [(chunk_length, n_seq, lstm_out_dim) for chunk] -> (batch_size, lstm_out_dim)
+            lstm_output = th.flatten(th.cat(lstm_outputs).transpose(0, 1), start_dim=0, end_dim=1)
+        else:
+            mask = (1.0 - episode_starts).view(1, n_seq, 1)
+            lstm_output, lstm_states = lstm(
+                features_sequence,
                 (
                     # Reset the states at the beginning of a new episode
-                    (1.0 - episode_start).view(1, n_seq, 1) * lstm_states[0],
-                    (1.0 - episode_start).view(1, n_seq, 1) * lstm_states[1],
+                    mask * lstm_states[0],
+                    mask * lstm_states[1],
                 ),
             )
-            lstm_output += [hidden]
-        # Sequence to batch
-        # (sequence length, n_seq, lstm_out_dim) -> (batch_size, lstm_out_dim)
-        lstm_output = th.flatten(th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1)
+
+            lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
         return lstm_output, lstm_states
 
     def forward(
@@ -403,8 +441,9 @@ class RecurrentActorCriticPolicy(ActorCriticPolicy):
 
         with th.no_grad():
             # Convert to PyTorch tensors
-            states = th.tensor(state[0], dtype=th.float32, device=self.device), th.tensor(
-                state[1], dtype=th.float32, device=self.device
+            states = (
+                th.tensor(state[0], dtype=th.float32, device=self.device),
+                th.tensor(state[1], dtype=th.float32, device=self.device),
             )
             episode_starts = th.tensor(episode_start, dtype=th.float32, device=self.device)
             actions, states = self._predict(
